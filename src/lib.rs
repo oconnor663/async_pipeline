@@ -22,7 +22,7 @@ impl<T> RendezvousSender<T> {
         self.sender
             .send(item)
             .await
-            .expect("the recipient should not drop");
+            .expect("receiver should not drop");
     }
 }
 
@@ -45,7 +45,10 @@ pub struct AsyncPipeline<Fut: Future, T> {
 }
 
 impl<Fut: Future, T> AsyncPipeline<Fut, T> {
-    pub fn then<U>(mut self, mut f: impl AsyncFnMut(T) -> U) -> AsyncPipeline<impl Future, U> {
+    pub fn then<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
+    where
+        F: AsyncFnMut(T) -> U,
+    {
         let (mut sender, receiver) = rendezvous_channel();
         AsyncPipeline {
             future: async {
@@ -63,7 +66,28 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
         }
     }
 
-    pub async fn for_each(mut self, mut f: impl AsyncFnMut(T)) {
+    pub fn buffered(mut self, buf_size: usize) -> AsyncPipeline<impl Future, T> {
+        assert!(buf_size > 0, "`buf_size` must be at least 1");
+        let (mut sender, receiver) = channel(buf_size);
+        AsyncPipeline {
+            future: async {
+                join! {
+                    self.future,
+                    async move {
+                        while let Some(input) = self.outputs.next().await {
+                            sender.send(input).await.expect("receiver should not drop");
+                        }
+                    }
+                };
+            },
+            outputs: receiver,
+        }
+    }
+
+    pub async fn for_each<F>(mut self, mut f: F)
+    where
+        F: AsyncFnMut(T),
+    {
         join! {
             self.future,
             async move {
@@ -147,6 +171,35 @@ mod tests {
         .for_each(async |i| {
             let in_flight = ELEMENTS_IN_FLIGHT.fetch_sub(1, Relaxed);
             assert_eq!(in_flight, 1, "too many elements in flight at i = {i}");
+            sleep(Duration::from_millis(1)).await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_buffered() {
+        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
+        static ELEMENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+        let mut i = 0u32;
+        pipeline(futures::stream::iter(std::iter::from_fn(|| {
+            if i < 10 {
+                let in_flight = ELEMENTS_IN_FLIGHT.fetch_add(1, Relaxed);
+                // This test might be a little too sensitive, but when the behavior changes I want
+                // to see it.
+                if i <= 4 {
+                    assert_eq!(in_flight, i.saturating_sub(1), "i = {i}");
+                } else {
+                    assert_eq!(in_flight, 4, "i = {i}");
+                }
+                i += 1;
+                Some(i)
+            } else {
+                None
+            }
+        })))
+        .buffered(3)
+        .for_each(async |_| {
+            ELEMENTS_IN_FLIGHT.fetch_sub(1, Relaxed);
             sleep(Duration::from_millis(1)).await;
         })
         .await;

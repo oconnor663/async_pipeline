@@ -1,5 +1,19 @@
 use futures::channel::mpsc::{Receiver, channel};
-use futures::{SinkExt, StreamExt, join};
+use futures::{SinkExt, Stream, StreamExt, join};
+use std::pin::pin;
+
+pub fn pipeline<S: Stream>(stream: S) -> AsyncPipeline<impl Future, S::Item> {
+    let (mut sender, receiver) = channel(0);
+    AsyncPipeline {
+        future: async move {
+            let mut stream = pin!(stream);
+            while let Some(item) = stream.next().await {
+                sender.send(item).await.unwrap();
+            }
+        },
+        outputs: receiver,
+    }
+}
 
 pub struct AsyncPipeline<Fut: Future, T> {
     future: Fut,
@@ -19,9 +33,34 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                             sender.send(output).await.unwrap();
                         }
                     }
-                }
+                };
             },
             outputs: receiver,
         }
+    }
+
+    pub async fn for_each(mut self, mut f: impl AsyncFnMut(T)) {
+        join! {
+            self.future,
+            async move {
+                while let Some(input) = self.outputs.next().await {
+                    f(input).await;
+                }
+            }
+        };
+    }
+
+    pub async fn collect<C: Default + Extend<T>>(mut self) -> C {
+        join! {
+            self.future,
+            async move {
+                let mut collection = C::default();
+                while let Some(input) = self.outputs.next().await {
+                    collection.extend(std::iter::once(input));
+                }
+                collection
+            }
+        }
+        .1
     }
 }

@@ -25,7 +25,7 @@ pub struct AsyncPipeline<Fut: Future, T> {
 }
 
 impl<Fut: Future, T> AsyncPipeline<Fut, T> {
-    pub fn then<F, U>(mut self, mut f: impl AsyncFnMut(T) -> U) -> AsyncPipeline<impl Future, U> {
+    pub fn then<U>(mut self, mut f: impl AsyncFnMut(T) -> U) -> AsyncPipeline<impl Future, U> {
         let (mut sender, receiver) = channel(0);
         AsyncPipeline {
             future: async {
@@ -67,5 +67,46 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
             }
         }
         .1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::{Duration, sleep};
+
+    #[tokio::test]
+    async fn test_for_each() {
+        let mut v = Vec::new();
+        pipeline(futures::stream::iter(0..5))
+            .then(async |x| {
+                sleep(Duration::from_millis(1)).await;
+                x + 1
+            })
+            .then(async |x| {
+                sleep(Duration::from_millis(1)).await;
+                10 * x
+            })
+            .for_each(async |x| {
+                v.push(x);
+            })
+            .await;
+        assert_eq!(v, vec![10, 20, 30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn test_collect() {
+        let v: Vec<_> = pipeline(futures::stream::iter(0..5))
+            .then(async |x| {
+                sleep(Duration::from_millis(1)).await;
+                x + 1
+            })
+            .then(async |x| {
+                sleep(Duration::from_millis(1)).await;
+                10 * x
+            })
+            .collect()
+            .await;
+        assert_eq!(v, vec![10, 20, 30, 40, 50]);
     }
 }

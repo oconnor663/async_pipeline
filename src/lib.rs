@@ -1,59 +1,44 @@
 use futures::channel::mpsc::{Receiver, channel};
-use futures::{SinkExt, Stream, StreamExt};
-use std::pin::{Pin, pin};
+use futures::{SinkExt, StreamExt, join};
 
-pub struct AsyncPipeline<'a, T> {
-    futures: Vec<Pin<Box<dyn Future<Output = ()> + Send + 'a>>>,
-    output: Receiver<T>,
+pub trait AsyncPipeline {
+    type Item;
+
+    fn into_future_and_outputs(self) -> (impl Future, Receiver<Self::Item>);
+
+    fn then<F, T>(self, mut f: F) -> Then<impl Future, T>
+    where
+        Self: Sized,
+        F: AsyncFnMut(Self::Item) -> T,
+    {
+        let (inner_future, mut inputs) = self.into_future_and_outputs();
+        let (mut sender, receiver) = channel(0);
+        Then {
+            future: async {
+                join! {
+                    inner_future,
+                    async move {
+                        while let Some(item) = inputs.next().await {
+                            let output = f(item).await;
+                            sender.send(output).await.unwrap();
+                        }
+                    }
+                }
+            },
+            outputs: receiver,
+        }
+    }
 }
 
-impl<'a, T> AsyncPipeline<'a, T>
-where
-    T: Send + 'a,
-{
-    pub fn new<S: Stream<Item = T> + Send + 'a>(stream: S) -> Self {
-        Self::new_buffered(stream, 1)
-    }
+pub struct Then<Fut, T> {
+    future: Fut,
+    outputs: Receiver<T>,
+}
 
-    pub fn new_buffered<S: Stream<Item = T> + Send + 'a>(stream: S, buf_size: usize) -> Self {
-        let (mut sender, receiver) = channel(buf_size);
-        let future = Box::pin(async move {
-            let mut stream = pin!(stream);
-            while let Some(item) = stream.next().await {
-                sender.send(item).await.unwrap();
-            }
-        });
-        Self {
-            futures: vec![future],
-            output: receiver,
-        }
-    }
+impl<Fut: Future, T> AsyncPipeline for Then<Fut, T> {
+    type Item = T;
 
-    pub fn map(self) -> Self {
-        todo!()
-    }
-
-    pub fn map_buffered(self) -> Self {
-        todo!()
-    }
-
-    pub fn map_concurrent(self) -> Self {
-        todo!()
-    }
-
-    pub fn map_unordered(self) -> Self {
-        todo!()
-    }
-
-    pub async fn for_each(mut self) {
-        while let Some(_) = self.output.next().await {}
-    }
-
-    pub async fn collect<C: Default + Extend<T>>(mut self) -> C {
-        let mut collection = C::default();
-        while let Some(item) = self.output.next().await {
-            collection.extend(std::iter::once(item));
-        }
-        collection
+    fn into_future_and_outputs(self) -> (impl Future, Receiver<Self::Item>) {
+        (self.future, self.outputs)
     }
 }

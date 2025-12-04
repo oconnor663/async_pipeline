@@ -1,4 +1,4 @@
-use futures::channel::mpsc::{Receiver, channel};
+use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::{SinkExt, Stream, StreamExt, join};
 use std::pin::pin;
 
@@ -13,6 +13,10 @@ pub fn pipeline<S: Stream>(stream: S) -> AsyncPipeline<impl Future, S::Item> {
         },
         outputs: receiver,
     }
+}
+
+fn sender_is_ready<T>(sender: &mut Sender<T>) -> impl Future {
+    std::future::poll_fn(|cx| sender.poll_ready(cx))
 }
 
 pub struct AsyncPipeline<Fut: Future, T> {
@@ -31,6 +35,7 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                         while let Some(input) = self.outputs.next().await {
                             let output = f(input).await;
                             sender.send(output).await.unwrap();
+                            sender_is_ready(&mut sender).await;
                         }
                     }
                 };

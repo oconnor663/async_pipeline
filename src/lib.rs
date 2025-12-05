@@ -50,11 +50,11 @@ impl<Fut: Future> ConcurrentFutures<Fut> {
         self.futures.push_back(Box::pin(maybe_done(fut)));
     }
 
-    // Drive all the contained futures until the first one (in order) is ready, then remove it and
-    // send its output to the provided channel. Of if this container is empty, return immediately.
-    //
-    // This method is **cancel-safe**. In particular, it waits until there's space in the output
-    // channel before taking the first future's output.
+    /// Drive all the contained futures until the first one (in order) is ready, then remove it and
+    /// send its output to the provided channel. Or if this container is empty, return immediately.
+    ///
+    /// This method is **cancel-safe**. In particular, it waits until there's space in the output
+    /// channel before taking the first future's output.
     fn await_and_send_first_output(
         &mut self,
         sender: &mut Sender<Fut::Output>,
@@ -157,28 +157,41 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                         loop {
                             let futures_len = futures.len();
                             let (maybe_input, _) = join_me_maybe!(
-                                async {
-                                    if futures_len == limit {
-                                        // The collection is full. Don't take any input until the
-                                        // next output is sent. Note that `return` ends this async
-                                        // block, not the whole join or the whole function.
-                                        return None;
-                                    }
-                                    // If we get an input, cancel the send side so that we can add
-                                    // a new future to the collection immediately. Otherwise, let
-                                    // the send side run.
-                                    if let Some(input) = inputs.next().await {
+                                await_input: async {
+                                    // If we're not at capacity, try to read another input.
+                                    if futures_len < limit && let Some(input) = inputs.next().await {
+                                        // We got another input. Cancel the send side so that we
+                                        // can invoke the caller's closure and add the new future
+                                        // to the collection immediately. Note that this side is
+                                        // cancel-safe because it doesn't .await again.
                                         send_output.cancel();
                                         Some(input)
                                     } else {
+                                        // Either we're at capacity or the inputs channel is
+                                        // closed. Let the send side run.
                                         None
                                     }
                                 },
-                                send_output: futures.await_and_send_first_output(&mut sender.sender),
+                                send_output: async {
+                                    // This method is cancel-safe, as documented above.
+                                    futures.await_and_send_first_output(&mut sender.sender).await;
+                                    // If there are still futures in the collection, cancel the
+                                    // input side so that we can loop around. This restarts the
+                                    // input side if we were at capacity before, and it lets this
+                                    // side keep making progress on buffered futures.
+                                    // TODO: Come up with a test case that fails if we miss this.
+                                    if futures.len() > 0 {
+                                        await_input.cancel();
+                                    }
+                                    // If not, let the input side run.
+                                }
                             );
-                            if let Some(input) = maybe_input {
+                            // If we got an input above, invoke the caller's closure and add the
+                            // new future to our collection.
+                            if let Some(input) = maybe_input.flatten() {
                                 futures.push_back(f(input));
                             }
+                            // Check whether this whole loop is done.
                             if inputs.is_done() && futures.len() == 0 {
                                 return;
                             }

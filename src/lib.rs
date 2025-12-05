@@ -1,6 +1,7 @@
 use futures::channel::mpsc::{Receiver, Sender, channel};
 use futures::future::{MaybeDone, maybe_done};
 use futures::{FutureExt, SinkExt, Stream, StreamExt, join};
+use join_me_maybe::join_me_maybe;
 use std::collections::VecDeque;
 use std::pin::{Pin, pin};
 use std::task::Poll;
@@ -172,12 +173,11 @@ impl<Fut: Future, T> AsyncPipeline<Fut, T> {
                                 }
                                 // Fusing inside a select! is normally a mistake, but in this case
                                 // I claim it's fine.
-                                futures::select!(
-                                    _ = sender.wait_for_space().fuse() => {}
+                                join_me_maybe!(
+                                    sender.wait_for_space(),
                                     // `poll_without_popping` makes sure we keep making forward
-                                    // progress, but it never returns. Only `wait_for_space` can
-                                    // complete this `join!`.
-                                    _ = futures.poll_without_popping().fuse() => {}
+                                    // progress, but it never completes.
+                                    maybe futures.poll_without_popping(),
                                 );
                                 // At this point we're guaranteed to be able to `send`, so we can
                                 // get an output without worrying about dropping it.

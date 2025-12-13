@@ -1,17 +1,187 @@
-use futures::channel::mpsc::{Receiver, Sender, channel};
-use futures::future::join;
+use atomic_refcell::AtomicRefCell;
+use futures::future::{Fuse, FusedFuture, join};
 use futures::stream::{FusedStream, FuturesOrdered, FuturesUnordered};
-use futures::{SinkExt, Stream, StreamExt};
+use futures::{FutureExt, Stream, StreamExt};
 use std::collections::VecDeque;
 use std::pin::{Pin, pin};
+use std::sync::Arc;
+use std::task::Waker;
 use std::task::{Context, Poll, Poll::Pending, Poll::Ready};
 
-enum OrderedOrUnorderedFutures<Fut: Future> {
+#[derive(Debug)]
+struct BufferInner<T> {
+    items: VecDeque<T>,
+    is_closed: bool,
+    // This waker is only used in the backwards direction, when a later stage wakes up a prior one
+    // by clearing space in its output buffer. Wakers aren't needed in the forward direction,
+    // because we always poll each stage right after the one that might've generated input for it.
+    sender_waker: Option<Waker>,
+}
+
+#[derive(Debug)]
+struct Buffer<T>(Arc<AtomicRefCell<BufferInner<T>>>);
+
+impl<T> Buffer<T> {
+    fn new(capacity: usize) -> Self {
+        Self(Arc::new(AtomicRefCell::new(BufferInner {
+            items: VecDeque::with_capacity(capacity),
+            is_closed: false,
+            sender_waker: None,
+        })))
+    }
+
+    fn push(&self, item: T) {
+        let mut this = self.0.borrow_mut();
+        assert!(this.items.len() < this.items.capacity());
+        assert!(!this.is_closed);
+        this.items.push_back(item);
+    }
+}
+
+impl<T> Clone for Buffer<T> {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+trait TypeErasedBuffer {
+    fn len(&self) -> usize;
+    fn is_empty(&self) -> bool;
+    fn close(&self);
+    fn register_sender_waker(&self, waker: Waker);
+}
+
+impl<T> TypeErasedBuffer for Buffer<T> {
+    fn len(&self) -> usize {
+        self.0.borrow().items.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    fn close(&self) {
+        self.0.borrow_mut().is_closed = true;
+    }
+
+    fn register_sender_waker(&self, waker: Waker) {
+        let mut this = self.0.borrow_mut();
+        assert!(!this.items.is_empty());
+        this.sender_waker = Some(waker);
+    }
+}
+
+impl<T> Stream for Buffer<T> {
+    type Item = T;
+
+    fn poll_next(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.0.borrow_mut();
+        // Any read of the buffer could potentially unblock the sender, even if the buffer isn't
+        // full, because the sender is also counting their own futures in flight against the
+        // capacity.
+        if let Some(waker) = this.sender_waker.take() {
+            // However, the sender shouldn't register a waker if the buffer is *empty*.
+            assert!(!this.items.is_empty());
+            waker.wake();
+        }
+        if let Some(item) = this.items.pop_front() {
+            Ready(Some(item))
+        } else if this.is_closed {
+            Ready(None)
+        } else {
+            // NOTE: No wakeup is registered in this case. The pipeline itself tracks when
+            // re-filling an empty buffer (or draining a full one) leads to a re-poll.
+            Pending
+        }
+    }
+}
+
+impl<T> FusedStream for Buffer<T> {
+    fn is_terminated(&self) -> bool {
+        let this = self.0.borrow();
+        this.items.is_empty() && this.is_closed
+    }
+}
+
+pin_project_lite::pin_project! {
+    struct PipelineStage<Fut, T> {
+        #[pin]
+        future: Fuse<Fut>,
+        outputs: Buffer<T>,
+    }
+}
+
+trait TypeErasedStage {
+    fn future(self: Pin<&mut Self>) -> Pin<&mut dyn Future<Output = ()>>;
+    fn is_done(&self) -> bool;
+    fn outputs_buffer(&self) -> &dyn TypeErasedBuffer;
+}
+
+impl<Fut: Future<Output = ()>, T> TypeErasedStage for PipelineStage<Fut, T> {
+    fn future(self: Pin<&mut Self>) -> Pin<&mut dyn Future<Output = ()>> {
+        self.project().future
+    }
+
+    fn is_done(&self) -> bool {
+        self.future.is_terminated()
+    }
+
+    fn outputs_buffer(&self) -> &dyn TypeErasedBuffer {
+        &self.outputs
+    }
+}
+
+fn poll_stages<'a>(
+    mut stages: Vec<Pin<Box<dyn TypeErasedStage + 'a>>>,
+) -> impl Future<Output = ()> + 'a {
+    std::future::poll_fn(move |cx| {
+        if stages.is_empty() {
+            return Ready(());
+        }
+        for i in 0..stages.len() {
+            let (prev_slice, rest_slice) = stages.split_at_mut(i);
+            let previous_stage = prev_slice.last().map(|s| &**s);
+            let inputs = previous_stage.map(TypeErasedStage::outputs_buffer);
+            let current_stage = &mut rest_slice[0];
+            if current_stage.as_mut().future().poll(cx).is_ready() {
+                assert!(
+                    previous_stage.is_none_or(TypeErasedStage::is_done),
+                    "later stage ({}) finished before previous ({})",
+                    i,
+                    i - 1,
+                );
+                assert!(
+                    inputs.is_none_or(TypeErasedBuffer::is_empty),
+                    "stage finished with leftover inputs"
+                );
+            }
+        }
+        if stages.last().unwrap().is_done() {
+            Ready(())
+        } else {
+            Pending
+        }
+    })
+}
+
+enum Executor<Fut: Future> {
     Ordered(FuturesOrdered<Fut>),
     Unordered(FuturesUnordered<Fut>),
 }
 
-impl<Fut: Future> OrderedOrUnorderedFutures<Fut> {
+enum ExecutorKind {
+    Ordered,
+    Unordered,
+}
+
+impl<Fut: Future> Executor<Fut> {
+    fn new(kind: ExecutorKind) -> Self {
+        match kind {
+            ExecutorKind::Ordered => Self::Ordered(FuturesOrdered::new()),
+            ExecutorKind::Unordered => Self::Unordered(FuturesUnordered::new()),
+        }
+    }
+
     fn len(&self) -> usize {
         match self {
             Self::Ordered(futures) => futures.len(),
@@ -38,331 +208,230 @@ impl<Fut: Future> OrderedOrUnorderedFutures<Fut> {
     }
 }
 
-/// Note that `Fut` here is assumed to be a filter-map. If it returns `Some(U)`, then we unwrap the
-/// output before buffering it. If it returns `None`, then we don't buffer it at all.
-struct InnerExecutor<Fut: Future<Output = Option<U>>, U> {
-    futures: OrderedOrUnorderedFutures<Fut>,
-    outputs: VecDeque<U>,
-}
-
-impl<Fut: Future<Output = Option<U>>, U> InnerExecutor<Fut, U> {
-    fn len(&self) -> usize {
-        self.futures.len() + self.outputs.len()
-    }
-
-    fn capacity(&self) -> usize {
-        self.outputs.capacity()
-    }
-
-    fn is_full(&self) -> bool {
-        assert!(self.len() <= self.capacity());
-        self.len() == self.capacity()
-    }
-
-    fn push(&mut self, future: Fut) {
-        assert!(!self.is_full());
-        self.futures.push(future);
-    }
-
-    /// Poll each of the buffered futures (making progress and registering wakeups) without
-    /// consuming any of their outputs, for example while the caller is waiting for space in the
-    /// outputs channel.
-    ///
-    /// This method is aware that its inner futures are filter-maps. Their outputs are `Option<U>`,
-    /// and when one of them yields `None`, that ouput doesn't get buffered and doesn't count
-    /// against the capacity.
-    ///
-    /// The name of this method comes from: https://without.boats/blog/poll-progress
-    fn poll_progress(&mut self, cx: &mut Context<'_>) {
-        while let Ready(Some(maybe_output)) = self.futures.poll_next(cx) {
-            // Handle the filter's `None` output.
-            if let Some(output) = maybe_output {
-                assert!(self.outputs.len() < self.outputs.capacity());
-                self.outputs.push_back(output);
-            }
-        }
-        // If the loop above ended in `Ready(None)`, then there are no buffered futures left. If it
-        // ended in `Pending`, there are futures left, and a wakeup is registered.
-    }
-
-    fn has_output(&self) -> bool {
-        !self.outputs.is_empty()
-    }
-
-    fn pop_output(&mut self) -> Option<U> {
-        self.outputs.pop_front()
-    }
-}
-
-enum InnerExecutorType {
-    Ordered { limit: usize },
-    Unordered { limit: usize },
-}
-
-fn new_inner_executor<Fut: Future<Output = Option<U>>, U>(
-    executor_type: InnerExecutorType,
-) -> InnerExecutor<Fut, U> {
-    match executor_type {
-        InnerExecutorType::Ordered { limit } => InnerExecutor {
-            futures: OrderedOrUnorderedFutures::Ordered(FuturesOrdered::new()),
-            outputs: VecDeque::with_capacity(limit),
-        },
-        InnerExecutorType::Unordered { limit } => InnerExecutor {
-            futures: OrderedOrUnorderedFutures::Unordered(FuturesUnordered::new()),
-            outputs: VecDeque::with_capacity(limit),
-        },
-    }
-}
-
-// We have to `await` this when we call it, but it always returns `Ready` immediately, so it's not
-// e.g. a cancellation point.
-async fn with_context_nonblocking<T>(f: impl FnOnce(&mut Context) -> T) -> T {
-    // `poll_fn` demands a FnMut, so use an Option workaround.
-    let mut f_option = Some(f);
+fn filter_map<T, U, S, F, Fut>(
+    mut inputs: Pin<&mut S>,
+    mut f: F,
+    outputs: Buffer<U>,
+    limit: usize,
+    kind: ExecutorKind,
+) -> impl Future<Output = ()>
+where
+    S: Stream<Item = T> + FusedStream,
+    F: FnMut(T) -> Fut,
+    Fut: Future<Output = Option<U>>,
+{
+    let mut executor = Executor::new(kind);
     std::future::poll_fn(move |cx| {
-        let t = (f_option.take().unwrap())(cx);
-        Ready(t)
+        loop {
+            let mut keep_looping = false;
+            // Try to receive an input input, if there's enough space in the output buffer. When
+            // the output buffer is full, we shouldn't have any futures in flight, and we won't
+            // start any until the next stage consumes an input. We require that the stream is
+            // fused, so we can keep polling it even after it's finished.
+            if executor.len() + outputs.len() < limit {
+                // If no input is available, this *might* register a wakeup, but only if the caller
+                // has added async work to the input stream. The `Buffer` itself will never
+                // register a wakeup, and instead the pipeline needs to track when one stage
+                // might've unblocked another.
+                if let Ready(Some(input)) = inputs.as_mut().poll_next(cx) {
+                    executor.push(f(input));
+                    keep_looping = true;
+                }
+            } else if outputs.len() > 0 {
+                // If there wasn't enough space in the output buffer, register a "sender waker".
+                // Note that the buffer doesn't need to be full for this to matter (just
+                // non-empty), because we're counting our futures in flight against the capacity,
+                // and it can't see that.
+                outputs.register_sender_waker(cx.waker().clone());
+            }
+            // Drive the futures in flight. If some of them are still pending, this will register a
+            // wakeup.
+            if let Ready(Some(maybe_output)) = executor.poll_next(cx) {
+                // The closure is a filter map, so we have another layer of `Option` here, and we drop
+                // the `None`s.
+                if let Some(output) = maybe_output {
+                    outputs.push(output);
+                }
+                keep_looping = true;
+            }
+            // If either the input side or the executor side retuned `Ready(Some(_))` above, keep
+            // looping.
+            if !keep_looping {
+                break;
+            }
+        }
+        if inputs.is_terminated() && executor.len() == 0 {
+            outputs.close();
+            Ready(())
+        } else {
+            Pending
+        }
     })
-    .await
 }
 
-// This is clearly an `async fn` that wishes it was a `Future` impl. It has to be this way to
-// compile on stable today, because there's no way to refer to the future that an
-// `AsyncFn`/`AsyncFnMut` returns, so we can't put it in a struct type (that also owns the closure
-// and needs to be able to express the relationship), and we can't put a `Send` bound on it either
-// (so we can't box it up in a way that's compatible with e.g. Tokio).
-async fn concurrent_pipe_executor<T, U>(
-    inner_executor_type: InnerExecutorType,
-    mut inputs: Receiver<T>,
-    filter_map: impl AsyncFn(T) -> Option<U>,
-    mut outputs: Sender<U>,
-) {
-    let mut inner_executor = new_inner_executor(inner_executor_type);
-
-    // If the input channel is closed, and the inner executor is empty (of both futures and
-    // outputs), then we're done. Note that here we don't consider whether there's an output in
-    // flight; that's handled by the outputs channel.
-    while !inputs.is_terminated() || inner_executor.len() > 0 {
-        // The input, output, and poll_progress tasks can all unblock each other, so we might need
-        // to run this loop more than once before yielding `pending!()`. We'll only yield if *none*
-        // of them made progress.
-        let mut loop_again_before_yielding = false;
-
-        // If an output is ready, and there's space in the outputs channel, send one.
-        let mut output_in_flight = 0;
-        let mut attempted_to_send_output = false;
-        if inner_executor.has_output() {
-            attempted_to_send_output = true;
-            let outputs_ready = with_context_nonblocking(|cx| outputs.poll_ready(cx)).await;
-            match outputs_ready {
-                Pending => output_in_flight = 1, // A wakeup is scheduled for this.
-                Ready(Err(_)) => panic!("outputs channel should not be closed"),
-                Ready(Ok(())) => {
-                    let output = inner_executor.pop_output().unwrap();
-                    outputs.start_send(output).unwrap();
-                    loop_again_before_yielding = true;
-                }
-            }
-        }
-
-        // If there's capacity in the inner executor (even counting the output in flight, if any)
-        // try to receive an input.
-        if inner_executor.len() + output_in_flight < inner_executor.capacity() {
-            let next_input =
-                with_context_nonblocking(|cx| Pin::new(&mut inputs).poll_next(cx)).await;
-            match next_input {
-                Pending => {}     // A wakeup is scheduled for this.
-                Ready(None) => {} // The channel is closed.
-                Ready(Some(input)) => {
-                    let future = (filter_map)(input);
-                    inner_executor.push(future);
-                    loop_again_before_yielding = true;
-                }
-            }
-        }
-
-        // Drive any buffered futures, potentially including one we just received. This might make
-        // progress internally, but the only way it could unblock the other tasks is by giving us
-        // some output to send when we didn't have any before.
-        with_context_nonblocking(|cx| inner_executor.poll_progress(cx)).await;
-        if !attempted_to_send_output && inner_executor.has_output() {
-            loop_again_before_yielding = true;
-        }
-
-        if !loop_again_before_yielding {
-            // We've made as much progress as we can and scheduled all the relevant wakeups.
-            futures::pending!();
-        }
-    }
+pub struct AsyncPipeline<'a, S: Stream + 'a> {
+    outputs: S,
+    stages: Vec<Pin<Box<dyn TypeErasedStage + 'a>>>,
 }
 
-pub fn pipeline<S: Stream>(stream: S) -> AsyncPipeline<impl Future, S::Item> {
-    let (mut sender, receiver) = channel(0);
-    AsyncPipeline {
-        future: async move {
-            let mut stream = pin!(stream);
-            while let Some(item) = stream.next().await {
-                sender.send(item).await.expect("channel should not close");
-            }
-        },
-        outputs: receiver,
-    }
-}
-
-pub struct AsyncPipeline<Fut: Future, T> {
-    future: Fut,
-    outputs: Receiver<T>,
-}
-
-impl<Fut: Future, T> AsyncPipeline<Fut, T> {
-    pub fn map<F, U>(self, mut f: F) -> AsyncPipeline<impl Future, U>
-    where
-        F: AsyncFnMut(T) -> U,
-    {
-        self.filter_map(async move |t| Some(f(t).await))
-    }
-
-    pub fn map_concurrent<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
-    where
-        F: AsyncFn(T) -> U,
-    {
-        self.filter_map_concurrent(async move |t| Some(f(t).await), limit)
-    }
-
-    pub fn map_unordered<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
-    where
-        F: AsyncFn(T) -> U,
-    {
-        self.filter_map_unordered(async move |t| Some(f(t).await), limit)
-    }
-
-    pub fn filter<F>(self, mut f: F) -> AsyncPipeline<impl Future, T>
-    where
-        F: AsyncFnMut(&T) -> bool,
-    {
-        self.filter_map(async move |t| f(&t).await.then_some(t))
-    }
-
-    pub fn filter_concurrent<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
-    where
-        F: AsyncFn(&T) -> bool,
-    {
-        self.filter_map_concurrent(async move |t| f(&t).await.then_some(t), limit)
-    }
-
-    pub fn filter_unordered<F>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, T>
-    where
-        F: AsyncFn(&T) -> bool,
-    {
-        self.filter_map_unordered(async move |t| f(&t).await.then_some(t), limit)
-    }
-
-    pub fn filter_map<F, U>(mut self, mut f: F) -> AsyncPipeline<impl Future, U>
-    where
-        F: AsyncFnMut(T) -> Option<U>,
-    {
-        let (mut sender, receiver) = channel(0);
-        AsyncPipeline {
-            future: join(self.future, async move {
-                while let Some(input) = self.outputs.next().await {
-                    if let Some(output) = f(input).await {
-                        sender.send(output).await.expect("channel should not close");
-                    }
-                }
-            }),
-            outputs: receiver,
+impl<'a, S: Stream> AsyncPipeline<'a, S> {
+    pub fn new(stream: S) -> Self {
+        Self {
+            outputs: stream,
+            stages: Vec::new(),
         }
     }
 
-    pub fn filter_map_concurrent<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
-    where
-        F: AsyncFn(T) -> Option<U>,
-    {
-        let (sender, receiver) = channel(0);
-        AsyncPipeline {
-            future: join(
-                self.future,
-                concurrent_pipe_executor(
-                    InnerExecutorType::Ordered { limit },
-                    self.outputs,
-                    async move |t| f(t).await,
-                    sender,
-                ),
-            ),
-            outputs: receiver,
-        }
-    }
-
-    pub fn filter_map_unordered<F, U>(self, f: F, limit: usize) -> AsyncPipeline<impl Future, U>
-    where
-        F: AsyncFn(T) -> Option<U>,
-    {
-        let (sender, receiver) = channel(0);
-        AsyncPipeline {
-            future: join(
-                self.future,
-                concurrent_pipe_executor(
-                    InnerExecutorType::Unordered { limit },
-                    self.outputs,
-                    async move |t| f(t).await,
-                    sender,
-                ),
-            ),
-            outputs: receiver,
-        }
-    }
-
-    /// By default a single element is buffered in between each pipeline stage. This adds a
-    /// pipeline state that buffers extra elements.
-    pub fn buffered(mut self, buf_size: usize) -> AsyncPipeline<impl Future, T> {
-        assert!(buf_size > 0, "`buf_size` must be at least 1");
-        let (mut sender, receiver) = channel(buf_size);
-        AsyncPipeline {
-            future: join(self.future, async move {
-                while let Some(input) = self.outputs.next().await {
-                    sender.send(input).await.expect("channel should not close");
-                }
-            }),
-            outputs: receiver,
-        }
-    }
-
-    pub async fn for_each<F>(mut self, mut f: F)
-    where
-        F: AsyncFnMut(T),
-    {
-        join(self.future, async move {
-            while let Some(input) = self.outputs.next().await {
-                f(input).await;
+    pub async fn for_each(self, mut f: impl AsyncFnMut(S::Item)) {
+        join(poll_stages(self.stages), async {
+            let mut outputs = pin!(self.outputs);
+            while let Some(item) = outputs.next().await {
+                f(item).await;
             }
         })
         .await;
     }
 
-    pub async fn for_each_concurrent<F>(self, f: F, limit: usize)
+    pub async fn for_each_concurrent(self, f: impl AsyncFn(S::Item), limit: usize) {
+        let mut inputs = pin!(self.outputs.fuse());
+        let mut executor = FuturesUnordered::new();
+        join(poll_stages(self.stages), async {
+            // This loop is basically a copy of `filter_map`, except that here we can use
+            // `AsyncFn()` here instead of `FnMut() -> impl Future`. This requires the "async fn
+            // that wishes it was a Future impl" programming style. When return type notation is
+            // stable, we should be able to use `AsyncFn` throughout the API and unify these.
+            loop {
+                let mut keep_looping = false;
+                if executor.len() < limit
+                    && let Ready(Some(input)) = futures::poll!(inputs.next())
+                {
+                    executor.push(f(input));
+                    keep_looping = true;
+                }
+                if let Ready(Some(())) = futures::poll!(executor.next()) {
+                    keep_looping = true;
+                }
+                if keep_looping {
+                    continue;
+                } else if inputs.is_terminated() && executor.is_empty() {
+                    return;
+                } else {
+                    futures::pending!();
+                }
+            }
+        })
+        .await;
+    }
+
+    pub async fn collect<C: Default + Extend<S::Item>>(self) -> C {
+        let mut collection = C::default();
+        self.for_each(async |item| {
+            collection.extend(std::iter::once(item));
+        })
+        .await;
+        collection
+    }
+
+    pub fn adapt_output_stream<F, S2>(self, f: F) -> AsyncPipeline<'a, S2>
     where
-        F: AsyncFn(T),
+        F: FnOnce(S) -> S2,
+        S2: Stream,
     {
-        self.map_unordered(
-            async move |input| {
-                f(input).await;
+        AsyncPipeline {
+            outputs: f(self.outputs),
+            stages: self.stages,
+        }
+    }
+
+    pub fn map_concurrent<F, Fut, U>(
+        self,
+        mut f: F,
+        limit: usize,
+    ) -> AsyncPipeline<'a, impl Stream<Item = U>>
+    where
+        F: FnMut(S::Item) -> Fut + 'a,
+        Fut: Future<Output = U> + 'a,
+        U: 'a,
+    {
+        self.filter_map_concurrent(
+            move |item| {
+                let fut = f(item);
+                async { Some(fut.await) }
             },
             limit,
         )
-        .for_each(async |_| {})
-        .await;
     }
 
-    pub async fn collect<C: Default + Extend<T>>(mut self) -> C {
-        join(self.future, async move {
-            let mut collection = C::default();
-            while let Some(input) = self.outputs.next().await {
-                collection.extend(std::iter::once(input));
+    pub fn map_unordered<F, Fut, U>(
+        self,
+        mut f: F,
+        limit: usize,
+    ) -> AsyncPipeline<'a, impl Stream<Item = U>>
+    where
+        F: FnMut(S::Item) -> Fut + 'a,
+        Fut: Future<Output = U> + 'a,
+        U: 'a,
+    {
+        self.filter_map_unordered(
+            move |item| {
+                let fut = f(item);
+                async { Some(fut.await) }
+            },
+            limit,
+        )
+    }
+
+    fn filter_map_inner<F, Fut, U>(
+        mut self,
+        f: F,
+        limit: usize,
+        kind: ExecutorKind,
+    ) -> AsyncPipeline<'a, impl Stream<Item = U>>
+    where
+        F: FnMut(S::Item) -> Fut + 'a,
+        Fut: Future<Output = Option<U>> + 'a,
+        U: 'a,
+    {
+        let buffer = Buffer::<U>::new(limit);
+        let buffer_clone = buffer.clone();
+        self.stages.push(Box::pin(PipelineStage {
+            outputs: buffer.clone(),
+            future: async move {
+                let inputs = pin!(self.outputs.fuse());
+                filter_map(inputs, f, buffer_clone, limit, kind).await;
             }
-            collection
-        })
-        .await
-        .1
+            .fuse(),
+        }));
+        AsyncPipeline {
+            outputs: buffer,
+            stages: self.stages,
+        }
+    }
+
+    pub fn filter_map_concurrent<F, Fut, U>(
+        self,
+        f: F,
+        limit: usize,
+    ) -> AsyncPipeline<'a, impl Stream<Item = U>>
+    where
+        F: FnMut(S::Item) -> Fut + 'a,
+        Fut: Future<Output = Option<U>> + 'a,
+        U: 'a,
+    {
+        self.filter_map_inner(f, limit, ExecutorKind::Ordered)
+    }
+
+    pub fn filter_map_unordered<F, Fut, U>(
+        self,
+        f: F,
+        limit: usize,
+    ) -> AsyncPipeline<'a, impl Stream<Item = U>>
+    where
+        F: FnMut(S::Item) -> Fut + 'a,
+        Fut: Future<Output = Option<U>> + 'a,
+        U: 'a,
+    {
+        self.filter_map_inner(f, limit, ExecutorKind::Unordered)
     }
 }
 
@@ -374,16 +443,23 @@ mod tests {
 
     #[tokio::test]
     async fn test_for_each() {
+        let inputs = [0, 1, 2, 3, 4];
         let mut v = Vec::new();
-        pipeline(futures::stream::iter(0..5))
-            .map(async |x| {
-                sleep(Duration::from_millis(1)).await;
-                x + 1
+        // Iterate over references, to make sure we can.
+        AsyncPipeline::new(futures::stream::iter(inputs.iter()))
+            .adapt_output_stream(|s| {
+                s.then(async |x| {
+                    sleep(Duration::from_millis(1)).await;
+                    x + 1
+                })
             })
-            .map(async |x| {
-                sleep(Duration::from_millis(1)).await;
-                10 * x
-            })
+            .map_concurrent(
+                async |x| {
+                    sleep(Duration::from_millis(1)).await;
+                    10 * x
+                },
+                3,
+            )
             .for_each(async |x| {
                 v.push(x);
             })
@@ -392,15 +468,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_collect() {
-        let v: Vec<_> = pipeline(futures::stream::iter(0..5))
-            .map(async |x| {
-                sleep(Duration::from_millis(1)).await;
-                x + 1
+    async fn test_for_each_concurrent() {
+        let v = Mutex::new(Vec::new());
+        AsyncPipeline::new(futures::stream::iter(0..5))
+            .adapt_output_stream(|s| {
+                s.then(async |x| {
+                    sleep(Duration::from_millis(1)).await;
+                    x + 1
+                })
             })
-            .map(async |x| {
-                sleep(Duration::from_millis(1)).await;
-                10 * x
+            .map_concurrent(
+                async |x| {
+                    sleep(Duration::from_millis(1)).await;
+                    10 * x
+                },
+                3,
+            )
+            .for_each_concurrent(
+                async |x| {
+                    v.lock().await.push(x);
+                },
+                3,
+            )
+            .await;
+        assert_eq!(v.into_inner(), vec![10, 20, 30, 40, 50]);
+    }
+
+    #[tokio::test]
+    async fn test_collect() {
+        let v: Vec<_> = AsyncPipeline::new(futures::stream::iter(0..5))
+            .adapt_output_stream(|s| {
+                s.then(async |x| {
+                    sleep(Duration::from_millis(1)).await;
+                    x + 1
+                })
+                .then(async |x| {
+                    sleep(Duration::from_millis(1)).await;
+                    10 * x
+                })
             })
             .collect()
             .await;
@@ -408,11 +513,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_rendezvous() {
+    async fn test_max_in_flight() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static ELEMENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         let mut i = 0;
-        pipeline(futures::stream::iter(std::iter::from_fn(|| {
+        AsyncPipeline::new(futures::stream::iter(std::iter::from_fn(|| {
             if i < 10 {
                 let in_flight = ELEMENTS_IN_FLIGHT.fetch_add(1, Relaxed);
                 assert_eq!(in_flight, 0, "too many elements in flight at i = {i}");
@@ -431,40 +536,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_buffered() {
-        use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
-        static ELEMENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-        let mut i = 0u32;
-        pipeline(futures::stream::iter(std::iter::from_fn(|| {
-            if i < 10 {
-                let in_flight = ELEMENTS_IN_FLIGHT.fetch_add(1, Relaxed);
-                // This test might be a little too sensitive, but when the behavior changes I want
-                // to see it.
-                if i <= 4 {
-                    assert_eq!(in_flight, i.saturating_sub(1), "i = {i}");
-                } else {
-                    assert_eq!(in_flight, 4, "i = {i}");
-                }
-                i += 1;
-                Some(i)
-            } else {
-                None
-            }
-        })))
-        .buffered(3)
-        .for_each(async |_| {
-            ELEMENTS_IN_FLIGHT.fetch_sub(1, Relaxed);
-            sleep(Duration::from_millis(1)).await;
-        })
-        .await;
-    }
-
-    #[tokio::test]
-    async fn test_concurrent() {
+    async fn test_map_concurrent() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-        let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
+        let v: Vec<i32> = AsyncPipeline::new(futures::stream::iter(0..10))
             .map_concurrent(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
@@ -478,14 +554,15 @@ mod tests {
             .collect()
             .await;
         assert_eq!(v, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
+        assert_eq!(MAX_IN_FLIGHT.load(Relaxed), 3);
     }
 
     #[tokio::test]
-    async fn test_concurrent_unordered() {
+    async fn test_map_unordered() {
         use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
         static FUTURES_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
         static MAX_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
-        let v: Vec<i32> = pipeline(futures::stream::iter(0..10))
+        let v: Vec<i32> = AsyncPipeline::new(futures::stream::iter(0..10))
             .map_unordered(
                 async |i| {
                     let in_flight = FUTURES_IN_FLIGHT.fetch_add(1, Relaxed);
@@ -499,62 +576,38 @@ mod tests {
             .collect()
             .await;
         assert_eq!(v, vec![0, 2, 4, 6, 8, 10, 12, 14, 16, 18]);
-    }
-
-    #[tokio::test]
-    async fn test_filter() {
-        let v = Mutex::new(Vec::new());
-        pipeline(futures::stream::iter(0..12))
-            .filter(async |x| x % 4 != 0)
-            .filter_concurrent(async |x| x % 4 != 1, 3)
-            .filter_unordered(
-                async |x| {
-                    // Provoke out-of-order behavior.
-                    sleep(Duration::from_millis(12 - x)).await;
-                    x % 4 != 2
-                },
-                3,
-            )
-            .for_each_concurrent(
-                async |x| {
-                    v.lock().await.push(x);
-                },
-                3,
-            )
-            .await;
-        let mut v = v.lock().await;
-        // Assert out-of-order behavior. This might end up being flaky, and if so I'll remove it.
-        // Update: Yep, it's flaky.
-        // assert_ne!(*v, vec![3, 7, 11]);
-        v.sort();
-        assert_eq!(*v, vec![3, 7, 11]);
+        assert_eq!(MAX_IN_FLIGHT.load(Relaxed), 3);
     }
 
     #[tokio::test]
     async fn test_deadlocks() {
         async fn foo(i: i32) -> i32 {
             static LOCK: Mutex<()> = Mutex::const_new(());
+            println!("locking foo({i})");
             let _guard = LOCK.lock();
+            println!("sleeping foo({i})");
             sleep(Duration::from_millis(rand::random_range(0..10))).await;
+            println!("waking foo({i})");
             i + 1
         }
 
-        // TODO: This is a compilation time disaster. It takes like 30 seconds. I don't know what
-        // to do...
-        let mut v: Vec<i32> = pipeline(futures::stream::iter(0..100))
-            .map(async |i| foo(i).await)
+        let v = Mutex::new(Vec::new());
+        AsyncPipeline::new(futures::stream::iter(0..100))
             .map_concurrent(async |i| foo(i).await, 10)
             .map_unordered(async |i| foo(i).await, 10)
-            .filter(async |_| true)
-            .filter_concurrent(async |_| true, 10)
-            .filter_unordered(async |_| true, 10)
-            .filter_map(async |i| Some(foo(i).await))
             .filter_map_concurrent(async |i| Some(foo(i).await), 10)
             .filter_map_unordered(async |i| Some(foo(i).await), 10)
-            .collect()
+            .for_each_concurrent(
+                async |i| {
+                    futures::join!(foo(i), foo(i), foo(i), foo(i), foo(i));
+                    v.lock().await.push(foo(i).await);
+                },
+                10,
+            )
             .await;
 
+        let mut v = v.into_inner();
         v.sort();
-        assert_eq!(v[..], (6..106).collect::<Vec<_>>());
+        assert_eq!(v[..], (5..105).collect::<Vec<_>>());
     }
 }

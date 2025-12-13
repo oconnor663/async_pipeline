@@ -4,8 +4,9 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+atomic_refcell = "0.1.13"
 futures = "0.3.31"
-join_me_maybe = "0.1.0"
+pin-project-lite = "0.2.16"
 
 [dev-dependencies]
 rand = "0.9.2"

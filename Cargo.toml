@@ -1,6 +1,12 @@
 [package]
 name = "async_pipeline"
 version = "0.1.0"
+authors = ["Jack O'Connor <oconnor663@gmail.com>"]
+description = "a deadlock-free replacement for buffered streams"
+repository = "https://github.com/oconnor663/async_pipeline"
+license = "Apache-2.0 OR MIT"
+documentation = "https://docs.rs/async_pipeline"
+readme = "README.md"
 edition = "2024"
 
 [dependencies]

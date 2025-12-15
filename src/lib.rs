@@ -372,6 +372,8 @@ where
 ///
 /// [`buffered`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffered
 ///
+/// See the [crate-level docs](crate) for more on the deadlocks that this type protects you from.
+///
 /// # Examples
 ///
 /// The simplest use case is to create a pipeline from an input iterator

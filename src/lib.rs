@@ -436,6 +436,33 @@ where
 /// assert_eq!(outputs, [0, 20, 40, 60, 80, 100, 120, 140, 160, 180]);
 /// # }
 /// ```
+///
+/// The [`adapt_stream`][AsyncPipeline::adapt_stream] method lets you apply arbitrary stream
+/// methods to the output of any stage. This is very flexible, though it doesn't add concurrency.
+/// (Please don't use the [`buffered`] method here, since you might reintroduce the deadlocks that
+/// this crate is trying to carefully to avoid.) Here's an example of using
+/// [`chain`](https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.chain) to
+/// add some extra elements both before and after a stage:
+///
+/// ```rust
+/// # use roughage::AsyncPipeline;
+/// # #[tokio::main]
+/// # async fn main() {
+/// use futures::{StreamExt, stream};
+///
+/// let outputs: Vec<u32> = AsyncPipeline::from_iter([4, 5, 6])
+///     .map_concurrent(async |i| i * 10, usize::MAX)
+///     .adapt_stream(|outputs| {
+///         stream::iter([1, 2, 3])
+///             .chain(outputs)
+///             .chain(stream::iter([7, 8, 9]))
+///     })
+///     .map_concurrent(async |i| i * 10, usize::MAX)
+///     .collect()
+///     .await;
+/// assert_eq!(outputs, [10, 20, 30, 400, 500, 600, 70, 80, 90]);
+/// # }
+/// ```
 pub struct AsyncPipeline<'a, S: Stream + 'a> {
     outputs: S,
     stages: Vec<Pin<Box<dyn TypeErasedStage + 'a>>>,
@@ -505,7 +532,7 @@ impl<'a, S: Stream> AsyncPipeline<'a, S> {
         collection
     }
 
-    pub fn adapt_output_stream<F, S2>(self, f: F) -> AsyncPipeline<'a, S2>
+    pub fn adapt_stream<F, S2>(self, f: F) -> AsyncPipeline<'a, S2>
     where
         F: FnOnce(S) -> S2,
         S2: Stream,
@@ -623,7 +650,7 @@ mod tests {
         let mut v = Vec::new();
         // Iterate over references, to make sure we can.
         AsyncPipeline::from_iter(&inputs)
-            .adapt_output_stream(|s| {
+            .adapt_stream(|s| {
                 s.then(async |x| {
                     sleep(Duration::from_millis(1)).await;
                     x + 1
@@ -647,7 +674,7 @@ mod tests {
     async fn test_for_each_concurrent() {
         let v = Mutex::new(Vec::new());
         AsyncPipeline::from_iter(0..5)
-            .adapt_output_stream(|s| {
+            .adapt_stream(|s| {
                 s.then(async |x| {
                     sleep(Duration::from_millis(1)).await;
                     x + 1
@@ -673,7 +700,7 @@ mod tests {
     #[tokio::test]
     async fn test_collect() {
         let v: Vec<_> = AsyncPipeline::from_iter(0..5)
-            .adapt_output_stream(|s| {
+            .adapt_stream(|s| {
                 s.then(async |x| {
                     sleep(Duration::from_millis(1)).await;
                     x + 1

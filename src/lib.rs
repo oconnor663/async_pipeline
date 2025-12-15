@@ -1,4 +1,4 @@
-//! This crate provides a single type, `AsyncPipeline`, which is an alternative to [`buffered`]
+//! This crate provides a single type, [`AsyncPipeline`], which is an alternative to [`buffered`]
 //! streams, [`FuturesOrdered`], and [`FuturesUnordered`].
 //!
 //! All of those are prone to deadlocks if any of their buffered/concurrent futures touches an
@@ -9,6 +9,7 @@
 //! consistently polling all its in-flight futures until they complete. In other words,
 //! `AsyncPipeline` will never "snooze" a future.
 //!
+//! [`AsyncPipeline`]: https://docs.rs/roughage/latest/roughage/struct.AsyncPipeline.html
 //! [`buffered`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffered
 //! [`FuturesOrdered`]: https://docs.rs/futures/latest/futures/stream/struct.FuturesOrdered.html
 //! [`FuturesUnordered`]: https://docs.rs/futures/latest/futures/stream/struct.FuturesUnordered.html
@@ -88,6 +89,8 @@
 //! // Deadlock free!
 //! # }
 //! ```
+//!
+//! See [`AsyncPipeline`] for more examples.
 //!
 //! "Roughage" (_ruff_-_edge_) is an older term for dietary fiber. It keeps our pipes running
 //! smoothly.
@@ -367,9 +370,72 @@ where
 
 /// Like a [`buffered`] stream, with the added guarantee that it won't "snooze" futures.
 ///
-/// See the [crate-level documentation](crate) for an example.
-///
 /// [`buffered`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffered
+///
+/// # Examples
+///
+/// The simplest use case is to create a pipeline from an input iterator
+/// ([`from_iter`][AsyncPipeline::from_iter]) or an input stream
+/// ([`from_stream`][AsyncPipeline::from_stream]) and then run it with
+/// [`for_each_concurrent`][AsyncPipeline::for_each_concurrent]. The `limit` argument gives the
+/// maximum number of futures that can run concurrently. Once the limit is reached, the pipeline
+/// will wait for in-flight futures to finish before starting more. This example runs the async
+/// closure 20 times in two groups of 10:
+/// ```rust,no_run
+/// # use roughage::AsyncPipeline;
+/// # use tokio::time::{Duration, sleep};
+/// # #[tokio::main]
+/// # async fn main() {
+/// AsyncPipeline::from_iter(0..20)
+///     .for_each_concurrent(
+///         async |i| {
+///             println!("starting {i}");
+///             sleep(Duration::from_secs(1)).await;
+///             println!("finished {i}");
+///         },
+///         10,
+///     )
+///     .await;
+/// # }
+/// ```
+///
+/// You can also add concurrent map or filter-map stages to the pipeline. All stages run
+/// concurrently until the whole pipeline is finished. To preserve the pipeline order, use
+/// [`map_concurrent`][AsyncPipeline::map_concurrent] or
+/// [`filter_map_concurrent`][AsyncPipeline::filter_map_concurrent]. If order doesn't matter, use
+/// [`map_unordered`][AsyncPipeline::map_unordered] or
+/// [`filter_map_unordered`][AsyncPipeline::filter_map_unordered]. Each of these also takes a
+/// `limit` argument. When you don't want a limit, you can use `usize::MAX`. This example uses a
+/// filter-map stage to extract the even numbers, uses a map stage to multiply them 10, and
+/// collects the results into a vector:
+///
+/// ```rust,no_run
+/// # use roughage::AsyncPipeline;
+/// # use tokio::time::{Duration, sleep};
+/// # #[tokio::main]
+/// # async fn main() {
+/// let outputs: Vec<u32> = AsyncPipeline::from_iter(0..20)
+///     .filter_map_concurrent(
+///         async |i| {
+///             println!("filter {i}");
+///             sleep(Duration::from_secs(1)).await;
+///             (i % 2 == 0).then_some(i)
+///         },
+///         10,
+///     )
+///     .map_concurrent(
+///         async |i| {
+///             println!("multiply {i}");
+///             sleep(Duration::from_secs(1)).await;
+///             i * 10
+///         },
+///         usize::MAX, // unlimited
+///     )
+///     .collect()
+///     .await;
+/// assert_eq!(outputs, [0, 20, 40, 60, 80, 100, 120, 140, 160, 180]);
+/// # }
+/// ```
 pub struct AsyncPipeline<'a, S: Stream + 'a> {
     outputs: S,
     stages: Vec<Pin<Box<dyn TypeErasedStage + 'a>>>,

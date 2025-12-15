@@ -1,6 +1,6 @@
 # `roughage` [![crates.io](https://img.shields.io/crates/v/roughage.svg)](https://crates.io/crates/roughage) [![docs.rs](https://docs.rs/roughage/badge.svg)](https://docs.rs/roughage)
 
-This crate provides a single type, `AsyncPipeline`, which is an alternative to [`buffered`]
+This crate provides a single type, [`AsyncPipeline`], which is an alternative to [`buffered`]
 streams, [`FuturesOrdered`], and [`FuturesUnordered`].
 
 All of those are prone to deadlocks if any of their buffered/concurrent futures touches an
@@ -11,6 +11,7 @@ progress through no fault of its own. `AsyncPipeline` fixes this whole class of 
 consistently polling all its in-flight futures until they complete. In other words,
 `AsyncPipeline` will never "snooze" a future.
 
+[`AsyncPipeline`]: https://docs.rs/roughage/latest/roughage/struct.AsyncPipeline.html
 [`buffered`]: https://docs.rs/futures/latest/futures/stream/trait.StreamExt.html#method.buffered
 [`FuturesOrdered`]: https://docs.rs/futures/latest/futures/stream/struct.FuturesOrdered.html
 [`FuturesUnordered`]: https://docs.rs/futures/latest/futures/stream/struct.FuturesUnordered.html
@@ -66,6 +67,8 @@ AsyncPipeline::from_iter(0..100)
     .await;
 // Deadlock free!
 ```
+
+See [`AsyncPipeline`] for more examples.
 
 "Roughage" (_ruff_-_edge_) is an older term for dietary fiber. It keeps our pipes running
 smoothly.

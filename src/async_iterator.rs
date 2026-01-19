@@ -339,7 +339,7 @@ mod tests {
 
     async fn foo(i: u32) -> u32 {
         static LOCK: Mutex<()> = Mutex::const_new(());
-        let _guard = LOCK.lock();
+        let _guard = LOCK.lock().await;
         tokio::time::sleep(Duration::from_millis(rand::random_range(0..10))).await;
         i
     }

@@ -166,6 +166,7 @@ where
             {
                 match iter.poll_next(cx) {
                     Poll::Ready(Some(fut)) => {
+                        dbg!();
                         this.executor.push((this.f)(fut));
                         progress = true;
                     }
@@ -183,6 +184,7 @@ where
             if let Poll::Ready(Some(maybe_item)) = this.executor.poll_next(cx) {
                 progress = true;
                 if let Some(item) = maybe_item {
+                    dbg!();
                     this.items.push_back(item);
                 }
             }
@@ -369,15 +371,32 @@ mod tests {
         assert_eq!(counter.load(Relaxed), 50);
     }
 
+    async fn random_sleep(i: u32) -> u32 {
+        tokio::time::sleep(Duration::from_millis(rand::random_range(0..10))).await;
+        i
+    }
+
     #[tokio::test]
     async fn test_filter_map_unordered() {
         let mut items: Vec<u32> = futures::stream::iter(0..100)
             .filter_map_unordered(
-                async |i| if i < 50 { Some(foo(i).await) } else { None },
+                async |i| {
+                    if i < 50 {
+                        Some(random_sleep(i).await)
+                    } else {
+                        None
+                    }
+                },
                 None,
             )
             .filter_map_unordered(
-                async |i| if i % 2 == 0 { Some(foo(i).await) } else { None },
+                async |i| {
+                    if i % 2 == 0 {
+                        Some(random_sleep(i).await)
+                    } else {
+                        None
+                    }
+                },
                 None,
             )
             .collect()
@@ -409,7 +428,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_buffer_unordered() {
-        let mut items: Vec<u32> = futures::stream::iter((0..100).map(|i| foo(i)))
+        let mut items: Vec<u32> = futures::stream::iter((0..100).map(|i| random_sleep(i)))
             .buffer_unordered(None)
             .collect()
             .await;

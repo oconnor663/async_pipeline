@@ -139,26 +139,37 @@ where
     type Item = T;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // If there are buffered items, return one of them without doing any work.
+        if let Some(item) = self.as_mut().project().items.pop_front() {
+            return Poll::Ready(Some(item));
+        }
+        // Try to buffer items.
         self.as_mut().poll_progress(cx);
         let this = self.project();
         if let Some(item) = this.items.pop_front() {
-            return Poll::Ready(Some(item));
-        }
-        if this.iter.is_some() || this.executor.len() > 0 {
+            // We buffered an item.
+            Poll::Ready(Some(item))
+        } else if this.iter.is_some() || this.executor.len() > 0 {
+            // We didn't buffer an item, but more items might arrive in the future.
             Poll::Pending
         } else {
+            // We're done.
             Poll::Ready(None)
         }
     }
 
     fn poll_progress(self: Pin<&mut Self>, cx: &mut Context<'_>) {
         let mut this = self.project();
+        let mut iter_pending = false;
         loop {
             let mut progress = false;
             // If there's capacity, try to buffer a new future.
             let len = this.executor.len() + this.items.len();
             let has_capacity = this.limit.is_none_or(|limit| len < limit);
-            if has_capacity && let Some(iter) = this.iter.as_mut().as_pin_mut() {
+            if let Some(iter) = this.iter.as_mut().as_pin_mut()
+                && has_capacity
+                && !iter_pending
+            {
                 match iter.poll_next(cx) {
                     Poll::Ready(Some(fut)) => {
                         this.executor.push((this.f)(fut));
@@ -167,7 +178,7 @@ where
                     Poll::Ready(None) => {
                         this.iter.set(None);
                     }
-                    Poll::Pending => {}
+                    Poll::Pending => iter_pending = true,
                 }
             }
             // Try to complete any buffered futures. Each future return either `Some(item)` or
@@ -182,6 +193,14 @@ where
                 }
             }
             if !progress {
+                if let Some(iter) = this.iter.as_pin_mut()
+                    && !iter_pending
+                {
+                    // We didn't drive the inner `AsyncIterator` to make progress on its own buffer
+                    // and register its own wakeups, and we need to do that before yielding
+                    // ourselves.
+                    iter.poll_progress(cx);
+                }
                 break;
             }
         }
@@ -214,20 +233,24 @@ where
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         let mut this = self.project();
+        let mut iter_pending = false;
         loop {
             let mut progress = false;
             // If there's capacity, try to buffer a new future.
             let has_capacity = this.limit.is_none_or(|limit| this.executor.len() < limit);
-            if has_capacity && let Some(iter) = this.iter.as_mut().as_pin_mut() {
+            if let Some(iter) = this.iter.as_mut().as_pin_mut()
+                && has_capacity
+                && !iter_pending
+            {
                 match iter.poll_next(cx) {
-                    Poll::Ready(Some(fut)) => {
-                        this.executor.push((this.f)(fut));
+                    Poll::Ready(Some(item)) => {
+                        this.executor.push((this.f)(item));
                         progress = true;
                     }
                     Poll::Ready(None) => {
                         this.iter.set(None);
                     }
-                    Poll::Pending => {}
+                    Poll::Pending => iter_pending = true,
                 }
             }
             // Try to complete any buffered futures.
@@ -235,11 +258,17 @@ where
                 progress = true;
             }
             if !progress {
-                if this.iter.is_none() && this.executor.len() == 0 {
+                if let Some(iter) = this.iter.as_pin_mut() {
+                    if !iter_pending {
+                        // We didn't drive the inner `AsyncIterator` to make progress on its own
+                        // buffer and register its own wakeups, and we need to do that before
+                        // yielding ourselves.
+                        iter.poll_progress(cx);
+                    }
+                } else if this.executor.len() == 0 {
                     return Poll::Ready(());
-                } else {
-                    return Poll::Pending;
                 }
+                return Poll::Pending;
             }
         }
     }
@@ -395,5 +424,44 @@ mod tests {
         assert_ne!(items, expected);
         items.sort_unstable();
         assert_eq!(items, expected);
+    }
+
+    #[tokio::test]
+    async fn test_limit() {
+        struct ConcurrencyGuard<'a> {
+            current: &'a AtomicU32,
+        }
+        impl ConcurrencyGuard<'_> {
+            fn new<'a>(current: &'a AtomicU32, max: &'a AtomicU32) -> ConcurrencyGuard<'a> {
+                let current_count = current.fetch_add(1, Relaxed) + 1;
+                max.fetch_max(current_count, Relaxed);
+                ConcurrencyGuard { current }
+            }
+        }
+        impl Drop for ConcurrencyGuard<'_> {
+            fn drop(&mut self) {
+                self.current.fetch_sub(1, Relaxed);
+            }
+        }
+        let max_concurrency = AtomicU32::new(0);
+        let current_concurrency = AtomicU32::new(0);
+        futures::stream::iter(0..20)
+            .filter_map_concurrent(
+                async |_| {
+                    let _guard = ConcurrencyGuard::new(&current_concurrency, &max_concurrency);
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Some(())
+                },
+                Some(4),
+            )
+            .for_each_concurrent(
+                async |_| {
+                    let _guard = ConcurrencyGuard::new(&current_concurrency, &max_concurrency);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                },
+                Some(2),
+            )
+            .await;
+        assert_eq!(max_concurrency.load(Relaxed), 6);
     }
 }
